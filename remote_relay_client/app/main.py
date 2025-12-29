@@ -3,6 +3,9 @@ import json
 import base64
 import aiohttp
 import websockets
+import sys
+sys.stdout = None
+sys.stderr = None
 from pathlib import Path
 
 OPTIONS_FILE = Path("/data/options.json")
