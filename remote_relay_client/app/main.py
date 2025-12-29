@@ -1,13 +1,24 @@
 import asyncio
+import json
 import websockets
-import os
+from pathlib import Path
 
-RELAY_URL = os.environ.get("RELAY_URL")
+OPTIONS_FILE = Path("/data/options.json")
+
+def load_options():
+    if not OPTIONS_FILE.exists():
+        raise RuntimeError("options.json not found")
+    with OPTIONS_FILE.open() as f:
+        return json.load(f)
 
 async def main():
-    if not RELAY_URL:
-        raise RuntimeError("RELAY_URL not set")
-    async with websockets.connect(RELAY_URL) as ws:
+    options = load_options()
+    relay_url = options.get("relay_url")
+
+    if not relay_url:
+        raise RuntimeError("relay_url not set in add-on configuration")
+
+    async with websockets.connect(relay_url) as ws:
         await ws.send("hello from Home Assistant add-on")
         while True:
             msg = await ws.recv()
