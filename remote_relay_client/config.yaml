@@ -1,5 +1,5 @@
 name: "Remote Relay Client"
-version: "0.1.35"
+version: "0.1.36"
 slug: "remote_relay_client"
 description: "Outbound tunnel client for remote access"
 arch:
