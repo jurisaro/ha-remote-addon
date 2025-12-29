@@ -1,16 +1,20 @@
 name: "Remote Relay Client"
-version: "0.1.36"
+version: "0.2.0"
 slug: "remote_relay_client"
-description: "Outbound tunnel client for remote access"
+description: "Outbound tunnel client for remote access (multi-device, secure)"
 arch:
   - amd64
   - aarch64
 startup: services
 boot: auto
 host_network: true
+
 options:
   relay_url: ""
-  device_key: ""
+  device_id: ""
+  secret: ""
+
 schema:
   relay_url: str
-  device_key: str
+  device_id: str
+  secret: str
