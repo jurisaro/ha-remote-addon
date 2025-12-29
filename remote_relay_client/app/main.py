@@ -1,36 +1,40 @@
 import asyncio
 import json
 import websockets
+import aiohttp
 from pathlib import Path
 
 OPTIONS_FILE = Path("/data/options.json")
 
 def load_options():
-    if not OPTIONS_FILE.exists():
-        raise RuntimeError("options.json not found")
     with OPTIONS_FILE.open() as f:
         return json.load(f)
 
+async def forward_to_ha(req):
+    async with aiohttp.ClientSession() as session:
+        async with session.request(
+            req["method"],
+            "http://homeassistant:8123" + req["path"],
+            headers=req["headers"],
+            data=req["body"].encode()
+        ) as resp:
+            return {
+                "status": resp.status,
+                "headers": dict(resp.headers),
+                "body": await resp.text()
+            }
+
 async def main():
     options = load_options()
-    relay_url = options.get("relay_url")
-    device_key = options.get("device_key")
-
-    if not relay_url:
-        raise RuntimeError("relay_url not set in add-on configuration")
-
-    if not device_key:
-        raise RuntimeError("device_key not set in add-on configuration")
+    relay_url = options["relay_url"]
+    device_key = options["device_key"]
 
     async with websockets.connect(relay_url) as ws:
-        # 1️⃣ AUTH – pirmais ziņojums
         await ws.send(device_key)
 
-        # 2️⃣ Testa ziņojums
-        await ws.send("hello from Home Assistant add-on")
-
-        while True:
-            msg = await ws.recv()
-            print(msg)
+        async for msg in ws:
+            req = json.loads(msg)
+            resp = await forward_to_ha(req)
+            await ws.send(json.dumps(resp))
 
 asyncio.run(main())
