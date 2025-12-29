@@ -1,8 +1,8 @@
 import asyncio
 import json
 import base64
-import websockets
 import aiohttp
+import websockets
 from pathlib import Path
 
 OPTIONS_FILE = Path("/data/options.json")
@@ -11,29 +11,6 @@ def load_options():
     with OPTIONS_FILE.open() as f:
         return json.load(f)
 
-
-async def forward_to_ha(req):
-    body_bytes = base64.b64decode(req.get("body_b64", ""))
-
-    async with aiohttp.ClientSession() as session:
-        async with session.request(
-            method=req["method"],
-            url="http://homeassistant:8123" + req["path"]
-                + (("?" + req["query_string"]) if req.get("query_string") else ""),
-            headers=req["headers"],
-            data=body_bytes,
-            allow_redirects=False,
-        ) as resp:
-
-            resp_body_bytes = await resp.read()
-
-            return {
-                "status": resp.status,
-                "headers": dict(resp.headers),
-                "body_b64": base64.b64encode(resp_body_bytes).decode("ascii"),
-            }
-
-
 async def main():
     options = load_options()
     relay_url = options["relay_url"]
@@ -41,19 +18,68 @@ async def main():
 
     while True:
         try:
-            async with websockets.connect(relay_url) as ws:
-                await ws.send(device_key)
+            async with websockets.connect(relay_url) as relay:
+                await relay.send(device_key)
                 print("Connected to relay")
 
-                async for msg in ws:
-                    req = json.loads(msg)
+                async with aiohttp.ClientSession() as session:
+                    ws_proxies = {}
 
-                    resp = await forward_to_ha(req)
+                    async for msg in relay:
+                        data = json.loads(msg)
 
-                    # ⭐ KRITISKI: request_id OBLIGĀTS
-                    resp["request_id"] = req["request_id"]
+                        # =====================
+                        # HTTP REQUEST
+                        # =====================
+                        if "request_id" in data:
+                            async with session.request(
+                                data["method"],
+                                "http://homeassistant:8123" + data["path"],
+                                headers={
+                                    k: v for k, v in data["headers"].items()
+                                    if k.lower() != "accept-encoding"
+                                },
+                                data=base64.b64decode(data["body_b64"]),
+                            ) as resp:
+                                body = await resp.read()
+                                await relay.send(json.dumps({
+                                    "request_id": data["request_id"],
+                                    "status": resp.status,
+                                    "headers": dict(resp.headers),
+                                    "body_b64": base64.b64encode(body).decode(),
+                                }))
 
-                    await ws.send(json.dumps(resp))
+                        # =====================
+                        # WS OPEN
+                        # =====================
+                        elif data.get("type") == "ws_open":
+                            ha_ws = await session.ws_connect(
+                                "http://homeassistant:8123/api/websocket"
+                            )
+                            ws_proxies[data["ws_id"]] = ha_ws
+
+                            async def pump(ws_id, ha_ws):
+                                async for msg in ha_ws:
+                                    await relay.send(json.dumps({
+                                        "type": "ws_recv",
+                                        "ws_id": ws_id,
+                                        "data": msg.data,
+                                    }))
+
+                            asyncio.create_task(pump(data["ws_id"], ha_ws))
+
+                        # =====================
+                        # WS SEND
+                        # =====================
+                        elif data.get("type") == "ws_send":
+                            await ws_proxies[data["ws_id"]].send_str(data["data"])
+
+                        # =====================
+                        # WS CLOSE
+                        # =====================
+                        elif data.get("type") == "ws_close":
+                            await ws_proxies[data["ws_id"]].close()
+                            ws_proxies.pop(data["ws_id"], None)
 
         except Exception as e:
             print("Disconnected, retrying in 2s:", e)
