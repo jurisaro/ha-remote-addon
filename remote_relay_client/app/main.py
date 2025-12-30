@@ -12,7 +12,7 @@ from pathlib import Path
 OPTIONS_FILE = Path("/data/options.json")
 LOG_FILE = Path("/data/client.log")
 
-MAX_BODY_SIZE = 20 * 1024 * 1024  # saskaņo ar serveri (20MB)
+MAX_BODY_SIZE = 20 * 1024 * 1024  # 20MB
 
 def log(msg: str) -> None:
     try:
@@ -52,7 +52,6 @@ async def main():
     device_id = options["device_id"].strip()
     secret = options["secret"].strip()
 
-    # Home Assistant base URL inside addon network
     ha_base = os.environ.get("HA_BASE", "http://homeassistant:8123")
 
     while True:
@@ -61,23 +60,25 @@ async def main():
 
             async with websockets.connect(
                 relay_url,
-                ping_interval=None,   # IMPORTANT: disable to avoid CF/nginx desync
+                ping_interval=None,   # IMPORTANT: disable CF/nginx desync
                 ping_timeout=None,
                 max_size=MAX_BODY_SIZE,
                 max_queue=64,
             ) as relay:
 
-                # -------------------------
-                # HANDSHAKE: {"device_id","ts","sig"}
-                # -------------------------
+                # -------- Handshake --------
                 ts = int(time.time())
                 hello_payload = {"device_id": device_id, "ts": ts}
-                hello = {"device_id": device_id, "ts": ts, "sig": sign(secret, hello_payload)}
+                hello = {
+                    "device_id": device_id,
+                    "ts": ts,
+                    "sig": sign(secret, hello_payload),
+                }
                 await relay.send(json.dumps(hello))
                 log("Handshake sent")
 
                 async with aiohttp.ClientSession() as session:
-                    ws_proxies = {}  # ws_id -> aiohttp websocket
+                    ws_proxies = {}
 
                     async for raw in relay:
                         if isinstance(raw, bytes):
@@ -95,23 +96,22 @@ async def main():
                         if not isinstance(payload, dict):
                             continue
 
-                        # Verify every payload (same as server expects)
                         if not verify(secret, payload, sig):
                             log(f"Bad signature for message type {mtype}")
                             continue
 
-                        # =========================
-                        # HTTP REQUEST: http_req
-                        # =========================
+                        # ---------- HTTP ----------
                         if mtype == "http_req":
                             req_id = payload.get("request_id")
                             method = payload.get("method", "GET")
                             path = payload.get("path", "/")
-                            headers = payload.get("headers", {}) or {}
                             body = b64d(payload.get("body_b64", ""))
 
-                            # Avoid compression issues
-                            headers = {k: v for k, v in headers.items() if k.lower() != "accept-encoding"}
+                            # 🔴 KRITISKAIS FIX: izņem Host + Accept-Encoding
+                            headers = {
+                                k: v for k, v in (payload.get("headers", {}) or {}).items()
+                                if k.lower() not in ("accept-encoding", "host")
+                            }
 
                             try:
                                 async with session.request(
@@ -121,7 +121,7 @@ async def main():
                                     data=body,
                                     timeout=aiohttp.ClientTimeout(total=60),
                                 ) as resp:
-                                    # Stream read with cap
+
                                     buf = bytearray()
                                     async for chunk in resp.content.iter_chunked(64 * 1024):
                                         buf += chunk
@@ -134,18 +134,19 @@ async def main():
                                         "headers": dict(resp.headers),
                                         "body_b64": b64e(bytes(buf)),
                                     }
+
                                     await relay.send(json.dumps({
                                         "type": "http_resp",
                                         "payload": resp_payload,
                                         "sig": sign(secret, resp_payload),
                                     }))
+
                             except Exception as e:
-                                # respond with 502 so browser doesn't hang
                                 resp_payload = {
                                     "request_id": req_id,
                                     "status": 502,
                                     "headers": {"content-type": "text/plain"},
-                                    "body_b64": b64e(f"HA request failed: {e}".encode("utf-8")),
+                                    "body_b64": b64e(str(e).encode()),
                                 }
                                 try:
                                     await relay.send(json.dumps({
@@ -156,9 +157,7 @@ async def main():
                                 except Exception:
                                     pass
 
-                        # =========================
-                        # WS OPEN: ws_open
-                        # =========================
+                        # ---------- WS OPEN ----------
                         elif mtype == "ws_open":
                             ws_id = payload.get("ws_id")
                             if not ws_id:
@@ -172,64 +171,55 @@ async def main():
                                 )
                                 ws_proxies[ws_id] = ha_ws
                             except Exception as e:
-                                log(f"Failed to open HA WS: {e}")
+                                log(f"HA WS open failed: {e}")
                                 continue
 
-                            async def pump_from_ha(ws_id_inner: str, ha_ws_inner: aiohttp.ClientWebSocketResponse):
+                            async def pump(ws_id_i, ha_ws_i):
                                 try:
-                                    async for m in ha_ws_inner:
+                                    async for m in ha_ws_i:
                                         if m.type == aiohttp.WSMsgType.TEXT:
-                                            out_payload = {"ws_id": ws_id_inner, "data": m.data}
+                                            out = {"ws_id": ws_id_i, "data": m.data}
                                             await relay.send(json.dumps({
                                                 "type": "ws_recv",
-                                                "payload": out_payload,
-                                                "sig": sign(secret, out_payload),
+                                                "payload": out,
+                                                "sig": sign(secret, out),
                                             }))
-                                        elif m.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                                            break
                                 except Exception:
                                     pass
                                 finally:
-                                    ws_proxies.pop(ws_id_inner, None)
-                                    closed_payload = {"ws_id": ws_id_inner}
+                                    ws_proxies.pop(ws_id_i, None)
+                                    closed = {"ws_id": ws_id_i}
                                     try:
                                         await relay.send(json.dumps({
                                             "type": "ws_closed",
-                                            "payload": closed_payload,
-                                            "sig": sign(secret, closed_payload),
+                                            "payload": closed,
+                                            "sig": sign(secret, closed),
                                         }))
                                     except Exception:
                                         pass
 
-                            asyncio.create_task(pump_from_ha(ws_id, ha_ws))
+                            asyncio.create_task(pump(ws_id, ha_ws))
 
-                        # =========================
-                        # WS SEND: ws_send
-                        # =========================
+                        # ---------- WS SEND ----------
                         elif mtype == "ws_send":
-                            ws_id = payload.get("ws_id")
-                            data = payload.get("data", "")
-                            ha_ws = ws_proxies.get(ws_id)
-                            if ha_ws:
+                            ws = ws_proxies.get(payload.get("ws_id"))
+                            if ws:
                                 try:
-                                    await ha_ws.send_str(data)
+                                    await ws.send_str(payload.get("data", ""))
                                 except Exception:
-                                    ws_proxies.pop(ws_id, None)
+                                    ws_proxies.pop(payload.get("ws_id"), None)
 
-                        # =========================
-                        # WS CLOSE: ws_close
-                        # =========================
+                        # ---------- WS CLOSE ----------
                         elif mtype == "ws_close":
-                            ws_id = payload.get("ws_id")
-                            ha_ws = ws_proxies.pop(ws_id, None)
-                            if ha_ws:
+                            ws = ws_proxies.pop(payload.get("ws_id"), None)
+                            if ws:
                                 try:
-                                    await ha_ws.close()
+                                    await ws.close()
                                 except Exception:
                                     pass
 
         except Exception as e:
-            log(f"Relay connection error: {e}; reconnecting in 2s")
+            log(f"Relay error: {e}; reconnecting in 2s")
             await asyncio.sleep(2)
 
 asyncio.run(main())
