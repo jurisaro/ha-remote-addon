@@ -9,11 +9,17 @@ import hashlib
 import os
 from pathlib import Path
 
+# =========================
+# FILES / LIMITS
+# =========================
 OPTIONS_FILE = Path("/data/options.json")
 LOG_FILE = Path("/data/client.log")
 
 MAX_BODY_SIZE = 20 * 1024 * 1024  # 20MB
 
+# =========================
+# UTILS
+# =========================
 def log(msg: str) -> None:
     try:
         LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -22,36 +28,51 @@ def log(msg: str) -> None:
     except Exception:
         pass
 
+
 def load_options():
     with OPTIONS_FILE.open() as f:
         return json.load(f)
 
+
 def canonical_json(obj) -> bytes:
     return json.dumps(obj, separators=(",", ":"), sort_keys=True).encode("utf-8")
 
-def sign(secret: str, payload_obj) -> str:
-    mac = hmac.new(secret.encode("utf-8"), canonical_json(payload_obj), hashlib.sha256).digest()
+
+def sign(secret: str, payload: dict) -> str:
+    mac = hmac.new(
+        secret.encode("utf-8"),
+        canonical_json(payload),
+        hashlib.sha256,
+    ).digest()
     return base64.b64encode(mac).decode("ascii")
 
-def verify(secret: str, payload_obj, sig_b64: str) -> bool:
+
+def verify(secret: str, payload: dict, sig: str) -> bool:
     try:
-        expected = sign(secret, payload_obj)
-        return hmac.compare_digest(expected, sig_b64 or "")
+        return hmac.compare_digest(sign(secret, payload), sig or "")
     except Exception:
         return False
+
 
 def b64e(b: bytes) -> str:
     return base64.b64encode(b).decode("ascii")
 
+
 def b64d(s: str) -> bytes:
     return base64.b64decode(s.encode("ascii")) if s else b""
 
+
+# =========================
+# MAIN
+# =========================
 async def main():
     options = load_options()
+
     relay_url = options["relay_url"].strip()
     device_id = options["device_id"].strip()
     secret = options["secret"].strip()
 
+    # HA inside addon network
     ha_base = os.environ.get("HA_BASE", "http://homeassistant:8123")
 
     while True:
@@ -60,25 +81,24 @@ async def main():
 
             async with websockets.connect(
                 relay_url,
-                ping_interval=None,   # IMPORTANT: disable CF/nginx desync
+                ping_interval=None,   # CF/nginx friendly
                 ping_timeout=None,
                 max_size=MAX_BODY_SIZE,
                 max_queue=64,
             ) as relay:
 
-                # -------- Handshake --------
+                # ---------- HANDSHAKE ----------
                 ts = int(time.time())
                 hello_payload = {"device_id": device_id, "ts": ts}
-                hello = {
+                await relay.send(json.dumps({
                     "device_id": device_id,
                     "ts": ts,
                     "sig": sign(secret, hello_payload),
-                }
-                await relay.send(json.dumps(hello))
-                log("Handshake sent")
+                }))
+                log("Handshake OK")
 
                 async with aiohttp.ClientSession() as session:
-                    ws_proxies = {}
+                    ws_map = {}  # ws_id -> aiohttp WS
 
                     async for raw in relay:
                         if isinstance(raw, bytes):
@@ -97,20 +117,27 @@ async def main():
                             continue
 
                         if not verify(secret, payload, sig):
-                            log(f"Bad signature for message type {mtype}")
+                            log(f"BAD SIG: {mtype}")
                             continue
 
-                        # ---------- HTTP ----------
+                        # ===============================
+                        # HTTP REQUEST (EC2 → HA)
+                        # ===============================
                         if mtype == "http_req":
                             req_id = payload.get("request_id")
                             method = payload.get("method", "GET")
                             path = payload.get("path", "/")
                             body = b64d(payload.get("body_b64", ""))
 
-                            # 🔴 KRITISKAIS FIX: izņem Host + Accept-Encoding
+                            # ❗ NEVER forward Host / Accept-Encoding
                             headers = {
-                                k: v for k, v in (payload.get("headers", {}) or {}).items()
-                                if k.lower() not in ("accept-encoding", "host")
+                                k: v for k, v in (payload.get("headers") or {}).items()
+                                if k.lower() not in (
+                                    "host",
+                                    "accept-encoding",
+                                    "content-length",
+                                    "connection",
+                                )
                             }
 
                             try:
@@ -142,7 +169,7 @@ async def main():
                                     }))
 
                             except Exception as e:
-                                resp_payload = {
+                                err = {
                                     "request_id": req_id,
                                     "status": 502,
                                     "headers": {"content-type": "text/plain"},
@@ -151,13 +178,15 @@ async def main():
                                 try:
                                     await relay.send(json.dumps({
                                         "type": "http_resp",
-                                        "payload": resp_payload,
-                                        "sig": sign(secret, resp_payload),
+                                        "payload": err,
+                                        "sig": sign(secret, err),
                                     }))
                                 except Exception:
                                     pass
 
-                        # ---------- WS OPEN ----------
+                        # ===============================
+                        # WS OPEN (browser → HA)
+                        # ===============================
                         elif mtype == "ws_open":
                             ws_id = payload.get("ws_id")
                             if not ws_id:
@@ -168,17 +197,24 @@ async def main():
                                     ha_base + "/api/websocket",
                                     heartbeat=30,
                                     max_msg_size=MAX_BODY_SIZE,
+                                    # ❗ CRITICAL: explicit Origin, no Host
+                                    headers={
+                                        "Origin": ha_base,
+                                    },
                                 )
-                                ws_proxies[ws_id] = ha_ws
+                                ws_map[ws_id] = ha_ws
                             except Exception as e:
-                                log(f"HA WS open failed: {e}")
+                                log(f"WS OPEN FAIL: {e}")
                                 continue
 
                             async def pump(ws_id_i, ha_ws_i):
                                 try:
                                     async for m in ha_ws_i:
                                         if m.type == aiohttp.WSMsgType.TEXT:
-                                            out = {"ws_id": ws_id_i, "data": m.data}
+                                            out = {
+                                                "ws_id": ws_id_i,
+                                                "data": m.data,
+                                            }
                                             await relay.send(json.dumps({
                                                 "type": "ws_recv",
                                                 "payload": out,
@@ -187,7 +223,7 @@ async def main():
                                 except Exception:
                                     pass
                                 finally:
-                                    ws_proxies.pop(ws_id_i, None)
+                                    ws_map.pop(ws_id_i, None)
                                     closed = {"ws_id": ws_id_i}
                                     try:
                                         await relay.send(json.dumps({
@@ -200,18 +236,22 @@ async def main():
 
                             asyncio.create_task(pump(ws_id, ha_ws))
 
-                        # ---------- WS SEND ----------
+                        # ===============================
+                        # WS SEND (browser → HA)
+                        # ===============================
                         elif mtype == "ws_send":
-                            ws = ws_proxies.get(payload.get("ws_id"))
+                            ws = ws_map.get(payload.get("ws_id"))
                             if ws:
                                 try:
                                     await ws.send_str(payload.get("data", ""))
                                 except Exception:
-                                    ws_proxies.pop(payload.get("ws_id"), None)
+                                    ws_map.pop(payload.get("ws_id"), None)
 
-                        # ---------- WS CLOSE ----------
+                        # ===============================
+                        # WS CLOSE
+                        # ===============================
                         elif mtype == "ws_close":
-                            ws = ws_proxies.pop(payload.get("ws_id"), None)
+                            ws = ws_map.pop(payload.get("ws_id"), None)
                             if ws:
                                 try:
                                     await ws.close()
@@ -219,7 +259,8 @@ async def main():
                                     pass
 
         except Exception as e:
-            log(f"Relay error: {e}; reconnecting in 2s")
+            log(f"Relay error: {e}, reconnecting in 2s")
             await asyncio.sleep(2)
+
 
 asyncio.run(main())
