@@ -1,13 +1,17 @@
 name: "Remote Relay Client"
-version: "0.2.2"
+version: "0.2.3"
 slug: "remote_relay_client"
-description: "Outbound tunnel client for remote access (multi-device, secure)"
+description: "Outbound-only secure relay client for Home Assistant API and WebSocket access"
 arch:
   - amd64
   - aarch64
+
 startup: services
 boot: auto
-host_network: true
+
+host_network: false
+homeassistant_api: true
+auth_api: true
 
 options:
   relay_url: ""
