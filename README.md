@@ -59,9 +59,43 @@ Security Rating: **6 / 8** (appropriate for a remote access component)
 
 ---
 
+## Installation
+
+### Pilot / GitHub Installation
+
+This add-on is currently distributed as a **pilot project** via a public GitHub repository and is **not yet available in the official Home Assistant Add-on Store**.
+
+To install:
+
+1. Open Home Assistant and navigate to:
+
+   * **Settings → Add-ons → Add-on Store → Repositories**
+
+2. Add the following repository URL:
+
+```
+https://github.com/jurisaro/ha-remote-addon.git
+```
+
+3. After adding the repository, locate **Remote Relay Client** in the Add-on Store and install it.
+
+4. Configure the add-on using the Home Assistant UI:
+
+   * `relay_url` – URL of the relay service
+   * `device_id` – Unique identifier for this Home Assistant instance
+   * `secret` – Per-device shared secret
+
+5. Start the add-on.
+
+Once started, the add-on will establish an outbound connection to the relay service.
+
+No inbound ports, firewall rules, or router configuration changes are required.
+
+---
+
 ## Configuration
 
-The add-on is configured via the Home Assistant UI.
+The add-on is configured exclusively through the Home Assistant UI.
 
 Required options:
 
