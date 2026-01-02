@@ -29,23 +29,15 @@ def log(msg: str) -> None:
     except Exception:
         pass
 
-
 def set_status(state: str, extra: dict | None = None):
-    data = {
-        "state": state,
-        "ts": int(time.time()),
-    }
+    data = {"state": state, "ts": int(time.time())}
     if extra:
         data.update(extra)
-
     try:
         STATUS_FILE.write_text(json.dumps(data), encoding="utf-8")
     except Exception:
         pass
-
-    # 👉 ŠIS PARĀDĀS ADD-ON LOGĀ
     log(f"STATUS: {state}" + (f" {extra}" if extra else ""))
-
 
 # =========================
 # UTILS
@@ -54,10 +46,8 @@ def load_options():
     with OPTIONS_FILE.open() as f:
         return json.load(f)
 
-
 def canonical_json(obj) -> bytes:
     return json.dumps(obj, separators=(",", ":"), sort_keys=True).encode("utf-8")
-
 
 def sign(secret: str, payload: dict) -> str:
     mac = hmac.new(
@@ -67,21 +57,17 @@ def sign(secret: str, payload: dict) -> str:
     ).digest()
     return base64.b64encode(mac).decode("ascii")
 
-
 def verify(secret: str, payload: dict, sig: str) -> bool:
     try:
         return hmac.compare_digest(sign(secret, payload), sig or "")
     except Exception:
         return False
 
-
 def b64e(b: bytes) -> str:
     return base64.b64encode(b).decode("ascii")
 
-
 def b64d(s: str) -> bytes:
     return base64.b64decode(s.encode("ascii")) if s else b""
-
 
 # =========================
 # MAIN LOOP
@@ -104,27 +90,37 @@ async def main():
 
             async with websockets.connect(
                 relay_url,
-                ping_interval=20,      # 🔥 KRITISKI
+                ping_interval=30,
                 ping_timeout=20,
-                close_timeout=5,
+                close_timeout=10,
                 max_size=MAX_BODY_SIZE,
-                max_queue=64,
+                max_queue=128,
             ) as relay:
+
+                relay_send_lock = asyncio.Lock()
+
+                async def relay_send_json(obj: dict):
+                    data = json.dumps(obj)
+                    async with relay_send_lock:
+                        # Prevent concurrent relay.send from multiple tasks
+                        await asyncio.wait_for(relay.send(data), timeout=10)
 
                 # ---------- HANDSHAKE ----------
                 ts = int(time.time())
                 hello_payload = {"device_id": device_id, "ts": ts}
-                await relay.send(json.dumps({
+                await relay_send_json({
                     "device_id": device_id,
                     "ts": ts,
                     "sig": sign(secret, hello_payload),
-                }))
+                })
 
                 set_status("connected", {"device_id": device_id})
                 log("Relay handshake OK")
                 backoff = 2
 
-                async with aiohttp.ClientSession() as session:
+                timeout = aiohttp.ClientTimeout(total=60)
+
+                async with aiohttp.ClientSession(timeout=timeout) as session:
                     ws_map: dict[str, aiohttp.ClientWebSocketResponse] = {}
 
                     async for raw in relay:
@@ -158,12 +154,7 @@ async def main():
 
                             headers = {
                                 k: v for k, v in (payload.get("headers") or {}).items()
-                                if k.lower() not in (
-                                    "host",
-                                    "accept-encoding",
-                                    "content-length",
-                                    "connection",
-                                )
+                                if k.lower() not in ("host", "accept-encoding", "content-length", "connection")
                             }
 
                             try:
@@ -188,11 +179,11 @@ async def main():
                                         "body_b64": b64e(bytes(buf)),
                                     }
 
-                                    await relay.send(json.dumps({
+                                    await relay_send_json({
                                         "type": "http_resp",
                                         "payload": resp_payload,
                                         "sig": sign(secret, resp_payload),
-                                    }))
+                                    })
 
                             except Exception as e:
                                 err = {
@@ -202,11 +193,11 @@ async def main():
                                     "body_b64": b64e(str(e).encode()),
                                 }
                                 try:
-                                    await relay.send(json.dumps({
+                                    await relay_send_json({
                                         "type": "http_resp",
                                         "payload": err,
                                         "sig": sign(secret, err),
-                                    }))
+                                    })
                                 except Exception:
                                     pass
 
@@ -230,50 +221,53 @@ async def main():
                                 log(f"WS OPEN FAIL {ws_id}: {e}")
                                 continue
 
-                            async def pump(ws_id_i, ha_ws_i):
+                            async def pump(ws_id_i: str, ha_ws_i: aiohttp.ClientWebSocketResponse):
                                 try:
                                     async for m in ha_ws_i:
                                         if m.type == aiohttp.WSMsgType.TEXT:
-                                            out = {
-                                                "ws_id": ws_id_i,
-                                                "data": m.data,
-                                            }
-                                            await relay.send(json.dumps({
+                                            out = {"ws_id": ws_id_i, "data": m.data}
+                                            await relay_send_json({
                                                 "type": "ws_recv",
                                                 "payload": out,
                                                 "sig": sign(secret, out),
-                                            }))
+                                            })
                                 except Exception as e:
                                     log(f"HA WS pump error {ws_id_i}: {e}")
                                 finally:
                                     ws_map.pop(ws_id_i, None)
                                     try:
-                                        await relay.send(json.dumps({
+                                        await relay_send_json({
                                             "type": "ws_closed",
                                             "payload": {"ws_id": ws_id_i},
                                             "sig": sign(secret, {"ws_id": ws_id_i}),
-                                        }))
+                                        })
+                                    except Exception:
+                                        pass
+                                    try:
+                                        await ha_ws_i.close()
                                     except Exception:
                                         pass
 
                             asyncio.create_task(pump(ws_id, ha_ws))
 
                         # ===============================
-                        # WS SEND
+                        # WS SEND (browser -> HA)
                         # ===============================
                         elif mtype == "ws_send":
-                            ws = ws_map.get(payload.get("ws_id"))
+                            ws_id = payload.get("ws_id")
+                            ws = ws_map.get(ws_id)
                             if ws:
                                 try:
-                                    await ws.send_str(payload.get("data", ""))
+                                    await asyncio.wait_for(ws.send_str(payload.get("data", "")), timeout=10)
                                 except Exception:
-                                    ws_map.pop(payload.get("ws_id"), None)
+                                    ws_map.pop(ws_id, None)
 
                         # ===============================
                         # WS CLOSE
                         # ===============================
                         elif mtype == "ws_close":
-                            ws = ws_map.pop(payload.get("ws_id"), None)
+                            ws_id = payload.get("ws_id")
+                            ws = ws_map.pop(ws_id, None)
                             if ws:
                                 try:
                                     await ws.close()
@@ -285,7 +279,6 @@ async def main():
             log(f"Relay error: {e}")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
-
 
 if __name__ == "__main__":
     asyncio.run(main())

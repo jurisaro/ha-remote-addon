@@ -1,5 +1,5 @@
 name: "Remote Relay Client"
-version: "0.2.3"
+version: "0.2.4"
 slug: "remote_relay_client"
 description: "Outbound-only secure relay client for Home Assistant API and WebSocket access"
 arch:
