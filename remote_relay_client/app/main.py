@@ -1,284 +1,458 @@
+#!/usr/bin/env python3
 import asyncio
-import json
 import base64
-import aiohttp
-import websockets
-import time
 import hmac
 import hashlib
-import os
+import json
+import time
+import uuid
+import threading
 from pathlib import Path
+from typing import Dict, Any, Optional
+from urllib.parse import urlparse
 
-# =========================
-# FILES / LIMITS
-# =========================
-OPTIONS_FILE = Path("/data/options.json")
-LOG_FILE = Path("/data/client.log")
-STATUS_FILE = Path("/data/status.json")
+from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
+import uvicorn
+import websockets
+from websockets.exceptions import ConnectionClosed
 
-MAX_BODY_SIZE = 20 * 1024 * 1024  # 20MB
+# ================= CONFIG =================
+BASE_DOMAIN = "myhalink.com"
+DEVICES_FILE = Path("/root/devices.json")  # <- ieliec precīzu ceļu, lai nav WD pārpratumu
 
-# =========================
-# LOG / STATUS
-# =========================
-def log(msg: str) -> None:
-    try:
-        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with LOG_FILE.open("a", encoding="utf-8") as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
-    except Exception:
-        pass
+USER_HOST = "0.0.0.0"
+USER_PORT = 8765
 
-def set_status(state: str, extra: dict | None = None):
-    data = {"state": state, "ts": int(time.time())}
-    if extra:
-        data.update(extra)
-    try:
-        STATUS_FILE.write_text(json.dumps(data), encoding="utf-8")
-    except Exception:
-        pass
-    log(f"STATUS: {state}" + (f" {extra}" if extra else ""))
+TUNNEL_HOST = "0.0.0.0"
+TUNNEL_PORT = 8766
 
-# =========================
-# UTILS
-# =========================
-def load_options():
-    with OPTIONS_FILE.open() as f:
-        return json.load(f)
+DEVICE_AWAIT_S = 25
+HTTP_TIMEOUT_S = 60
+DEVICE_SEND_TIMEOUT_S = 10
 
-def canonical_json(obj) -> bytes:
-    return json.dumps(obj, separators=(",", ":"), sort_keys=True).encode("utf-8")
+MAX_MSG_SIZE = 20 * 1024 * 1024
+MAX_QUEUE = 128
 
-def sign(secret: str, payload: dict) -> str:
-    mac = hmac.new(
-        secret.encode("utf-8"),
-        canonical_json(payload),
-        hashlib.sha256,
-    ).digest()
-    return base64.b64encode(mac).decode("ascii")
+TUNNEL_PING_INTERVAL_S = 30
+TUNNEL_PING_TIMEOUT_S = 20
+TUNNEL_CLOSE_TIMEOUT_S = 10
 
-def verify(secret: str, payload: dict, sig: str) -> bool:
-    try:
-        return hmac.compare_digest(sign(secret, payload), sig or "")
-    except Exception:
-        return False
+# ================= APP ====================
+app = FastAPI()
+
+# ================= STATE ==================
+device_ws: Dict[str, websockets.WebSocketServerProtocol] = {}
+device_send_q: Dict[str, asyncio.Queue] = {}
+device_writer_task: Dict[str, asyncio.Task] = {}
+
+pending_http: Dict[str, asyncio.Future] = {}
+pending_ws: Dict[str, WebSocket] = {}
+
+device_connected_evt: Dict[str, asyncio.Event] = {}
+device_last_seen: Dict[str, float] = {}
+
+request_owner: Dict[str, str] = {}
+
+metrics = {
+    "boot_ts": int(time.time()),
+    "device_connected": 0,
+    "device_disconnected": 0,
+    "device_reconnected": 0,
+    "await_device_success": 0,
+    "await_device_timeout": 0,
+    "http_requests": 0,
+    "http_timeouts": 0,
+    "http_upstream_errors": 0,
+    "ws_open": 0,
+    "ws_send": 0,
+    "ws_send_blocked": 0,
+    "device_send_ok": 0,
+    "device_send_fail": 0,
+    "bad_sig": 0,
+}
+
+# ================= UTILS ==================
+def log(msg: str):
+    print(msg, flush=True)
+
+def load_devices():
+    with DEVICES_FILE.open() as f:
+        return {d["device_id"]: d["secret"] for d in json.load(f)}
+
+DEVICES = load_devices()
+
+def canonical(obj: Any) -> bytes:
+    return json.dumps(obj, separators=(",", ":"), sort_keys=True).encode()
+
+def sign(secret: str, payload: Any) -> str:
+    return base64.b64encode(
+        hmac.new(secret.encode(), canonical(payload), hashlib.sha256).digest()
+    ).decode()
+
+def verify(secret: str, payload: Any, sig: str) -> bool:
+    return hmac.compare_digest(sign(secret, payload), sig or "")
 
 def b64e(b: bytes) -> str:
-    return base64.b64encode(b).decode("ascii")
+    return base64.b64encode(b).decode()
 
 def b64d(s: str) -> bytes:
-    return base64.b64decode(s.encode("ascii")) if s else b""
+    return base64.b64decode(s) if s else b""
 
-# =========================
-# MAIN LOOP
-# =========================
-async def main():
-    options = load_options()
+def device_from_host(host: Optional[str]) -> Optional[str]:
+    if not host:
+        return None
+    h = host.split(":")[0].lower()
+    if h.endswith("." + BASE_DOMAIN):
+        return h[: -(len(BASE_DOMAIN) + 1)]
+    return None
 
-    relay_url = options["relay_url"].strip()
-    device_id = options["device_id"].strip()
-    secret = options["secret"].strip()
+def origin_host(origin: Optional[str]) -> Optional[str]:
+    if not origin:
+        return None
+    try:
+        return urlparse(origin).hostname
+    except Exception:
+        return None
 
-    ha_base = os.environ.get("HA_BASE", "http://homeassistant:8123")
+def get_or_make_evt(did: str) -> asyncio.Event:
+    evt = device_connected_evt.get(did)
+    if not evt:
+        evt = asyncio.Event()
+        device_connected_evt[did] = evt
+    return evt
 
-    backoff = 2
+async def await_device(did: str, timeout_s: int) -> bool:
+    if device_ws.get(did):
+        return True
+    evt = get_or_make_evt(did)
+    try:
+        await asyncio.wait_for(evt.wait(), timeout=timeout_s)
+        return bool(device_ws.get(did))
+    except asyncio.TimeoutError:
+        return False
 
+def fail_pending_for_device(did: str, reason: str):
+    doomed = [rid for rid, owner in request_owner.items() if owner == did]
+    for rid in doomed:
+        fut = pending_http.pop(rid, None)
+        request_owner.pop(rid, None)
+        if fut and not fut.done():
+            fut.set_exception(ConnectionError(reason))
+
+async def device_writer(did: str):
+    q = device_send_q[did]
     while True:
+        item = await q.get()
+        if item is None:
+            q.task_done()
+            return
+        ws = device_ws.get(did)
+        if not ws:
+            metrics["device_send_fail"] += 1
+            q.task_done()
+            continue
         try:
-            set_status("connecting", {"relay": relay_url})
-            log(f"Connecting to relay {relay_url} as {device_id}")
+            await asyncio.wait_for(ws.send(item), timeout=DEVICE_SEND_TIMEOUT_S)
+            metrics["device_send_ok"] += 1
+        except Exception:
+            metrics["device_send_fail"] += 1
+        finally:
+            q.task_done()
 
-            async with websockets.connect(
-                relay_url,
-                ping_interval=30,
-                ping_timeout=20,
-                close_timeout=10,
-                max_size=MAX_BODY_SIZE,
-                max_queue=128,
-            ) as relay:
+async def device_send(did: str, data: str) -> bool:
+    q = device_send_q.get(did)
+    if not q:
+        q = asyncio.Queue(maxsize=MAX_QUEUE)
+        device_send_q[did] = q
+    if did not in device_writer_task or device_writer_task[did].done():
+        device_writer_task[did] = asyncio.create_task(device_writer(did))
+    try:
+        q.put_nowait(data)
+        return True
+    except asyncio.QueueFull:
+        return False
 
-                relay_send_lock = asyncio.Lock()
+# ================= TUNNEL =================
+async def handle_device(ws: websockets.WebSocketServerProtocol):
+    did = None
+    log("[TUNNEL] incoming connection")
+    try:
+        # v21 stils: GAIDA hello bez timeout
+        hello_raw = await ws.recv()
+        log("[TUNNEL] hello received")
+        hello = json.loads(hello_raw)
 
-                async def relay_send_json(obj: dict):
-                    data = json.dumps(obj)
-                    async with relay_send_lock:
-                        # Prevent concurrent relay.send from multiple tasks
-                        await asyncio.wait_for(relay.send(data), timeout=10)
+        did = hello.get("device_id")
+        ts = hello.get("ts")
+        sig = hello.get("sig")
 
-                # ---------- HANDSHAKE ----------
-                ts = int(time.time())
-                hello_payload = {"device_id": device_id, "ts": ts}
-                await relay_send_json({
-                    "device_id": device_id,
-                    "ts": ts,
-                    "sig": sign(secret, hello_payload),
-                })
+        if not did or did not in DEVICES:
+            log("[TUNNEL] unknown device in hello")
+            return
 
-                set_status("connected", {"device_id": device_id})
-                log("Relay handshake OK")
-                backoff = 2
+        if not verify(DEVICES[did], {"device_id": did, "ts": ts}, sig):
+            log(f"[TUNNEL] bad hello sig {did}")
+            metrics["bad_sig"] += 1
+            return
 
-                timeout = aiohttp.ClientTimeout(total=60)
+        prev = device_ws.get(did)
+        device_ws[did] = ws
+        device_last_seen[did] = time.time()
 
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    ws_map: dict[str, aiohttp.ClientWebSocketResponse] = {}
+        evt = get_or_make_evt(did)
+        evt.set()
 
-                    async for raw in relay:
-                        if isinstance(raw, bytes):
-                            raw = raw.decode("utf-8", errors="ignore")
+        if prev:
+            metrics["device_reconnected"] += 1
+            log(f"[DEVICE RECONNECTED] {did}")
+        else:
+            metrics["device_connected"] += 1
+            log(f"[DEVICE CONNECTED] {did}")
 
-                        try:
-                            msg = json.loads(raw)
-                        except Exception:
-                            continue
+        async for msg in ws:
+            device_last_seen[did] = time.time()
+            try:
+                data = json.loads(msg)
+            except Exception:
+                continue
 
-                        mtype = msg.get("type")
-                        payload = msg.get("payload")
-                        sig = msg.get("sig")
+            mtype = data.get("type")
+            payload = data.get("payload")
+            sig = data.get("sig")
 
-                        if not isinstance(payload, dict):
-                            continue
+            if not isinstance(payload, dict):
+                continue
 
-                        if not verify(secret, payload, sig):
-                            log(f"BAD SIG: {mtype}")
-                            continue
+            if not verify(DEVICES[did], payload, sig):
+                metrics["bad_sig"] += 1
+                continue
 
-                        # ===============================
-                        # HTTP REQUEST
-                        # ===============================
-                        if mtype == "http_req":
-                            req_id = payload.get("request_id")
-                            method = payload.get("method", "GET")
-                            path = payload.get("path", "/")
-                            body = b64d(payload.get("body_b64", ""))
+            if mtype == "http_resp":
+                rid = payload.get("request_id")
+                fut = pending_http.pop(rid, None)
+                request_owner.pop(rid, None)
+                if fut and not fut.done():
+                    fut.set_result(payload)
 
-                            headers = {
-                                k: v for k, v in (payload.get("headers") or {}).items()
-                                if k.lower() not in ("host", "accept-encoding", "content-length", "connection")
-                            }
+            elif mtype == "ws_recv":
+                ws_id = payload.get("ws_id")
+                bw = pending_ws.get(ws_id)
+                if bw:
+                    try:
+                        await bw.send_text(payload.get("data", ""))
+                    except Exception:
+                        pending_ws.pop(ws_id, None)
 
-                            try:
-                                async with session.request(
-                                    method,
-                                    ha_base + path,
-                                    headers=headers,
-                                    data=body,
-                                    timeout=aiohttp.ClientTimeout(total=60),
-                                ) as resp:
+            elif mtype == "ws_closed":
+                ws_id = payload.get("ws_id")
+                pending_ws.pop(ws_id, None)
 
-                                    buf = bytearray()
-                                    async for chunk in resp.content.iter_chunked(64 * 1024):
-                                        buf += chunk
-                                        if len(buf) > MAX_BODY_SIZE:
-                                            break
+    except ConnectionClosed:
+        # normāls tīkla pārtraukums
+        pass
+    except Exception as e:
+        log(f"[TUNNEL] handler error: {e}")
+    finally:
+        if did:
+            if device_ws.get(did) is ws:
+                device_ws.pop(did, None)
 
-                                    resp_payload = {
-                                        "request_id": req_id,
-                                        "status": resp.status,
-                                        "headers": dict(resp.headers),
-                                        "body_b64": b64e(bytes(buf)),
-                                    }
+            metrics["device_disconnected"] += 1
+            log(f"[DEVICE DISCONNECTED] {did}")
 
-                                    await relay_send_json({
-                                        "type": "http_resp",
-                                        "payload": resp_payload,
-                                        "sig": sign(secret, resp_payload),
-                                    })
+            evt = get_or_make_evt(did)
+            evt.clear()
 
-                            except Exception as e:
-                                err = {
-                                    "request_id": req_id,
-                                    "status": 502,
-                                    "headers": {"content-type": "text/plain"},
-                                    "body_b64": b64e(str(e).encode()),
-                                }
-                                try:
-                                    await relay_send_json({
-                                        "type": "http_resp",
-                                        "payload": err,
-                                        "sig": sign(secret, err),
-                                    })
-                                except Exception:
-                                    pass
+            fail_pending_for_device(did, "device disconnected")
 
-                        # ===============================
-                        # WS OPEN
-                        # ===============================
-                        elif mtype == "ws_open":
-                            ws_id = payload.get("ws_id")
-                            if not ws_id:
-                                continue
+            q = device_send_q.get(did)
+            if q:
+                try:
+                    q.put_nowait(None)
+                except Exception:
+                    pass
 
-                            try:
-                                ha_ws = await session.ws_connect(
-                                    ha_base + "/api/websocket",
-                                    heartbeat=30,
-                                    max_msg_size=MAX_BODY_SIZE,
-                                    headers={"Origin": ha_base},
-                                )
-                                ws_map[ws_id] = ha_ws
-                            except Exception as e:
-                                log(f"WS OPEN FAIL {ws_id}: {e}")
-                                continue
+async def tunnel_main():
+    async with websockets.serve(
+        handle_device,
+        TUNNEL_HOST,
+        TUNNEL_PORT,
+        ping_interval=TUNNEL_PING_INTERVAL_S,
+        ping_timeout=TUNNEL_PING_TIMEOUT_S,
+        close_timeout=TUNNEL_CLOSE_TIMEOUT_S,
+        max_size=MAX_MSG_SIZE,
+        max_queue=MAX_QUEUE,
+    ):
+        log(f"[TUNNEL] listening on {TUNNEL_PORT}")
+        await asyncio.Future()
 
-                            async def pump(ws_id_i: str, ha_ws_i: aiohttp.ClientWebSocketResponse):
-                                try:
-                                    async for m in ha_ws_i:
-                                        if m.type == aiohttp.WSMsgType.TEXT:
-                                            out = {"ws_id": ws_id_i, "data": m.data}
-                                            await relay_send_json({
-                                                "type": "ws_recv",
-                                                "payload": out,
-                                                "sig": sign(secret, out),
-                                            })
-                                except Exception as e:
-                                    log(f"HA WS pump error {ws_id_i}: {e}")
-                                finally:
-                                    ws_map.pop(ws_id_i, None)
-                                    try:
-                                        await relay_send_json({
-                                            "type": "ws_closed",
-                                            "payload": {"ws_id": ws_id_i},
-                                            "sig": sign(secret, {"ws_id": ws_id_i}),
-                                        })
-                                    except Exception:
-                                        pass
-                                    try:
-                                        await ha_ws_i.close()
-                                    except Exception:
-                                        pass
+def start_tunnel_thread():
+    asyncio.run(tunnel_main())
 
-                            asyncio.create_task(pump(ws_id, ha_ws))
+# ================= HTTP ===================
+@app.get("/_metrics")
+async def metrics_endpoint():
+    data = dict(metrics)
+    data["devices_connected_now"] = len(device_ws)
+    data["pending_http"] = len(pending_http)
+    data["pending_ws"] = len(pending_ws)
+    now = time.time()
+    data["device_idle_s"] = {k: int(now - v) for k, v in device_last_seen.items()}
+    return data
 
-                        # ===============================
-                        # WS SEND (browser -> HA)
-                        # ===============================
-                        elif mtype == "ws_send":
-                            ws_id = payload.get("ws_id")
-                            ws = ws_map.get(ws_id)
-                            if ws:
-                                try:
-                                    await asyncio.wait_for(ws.send_str(payload.get("data", "")), timeout=10)
-                                except Exception:
-                                    ws_map.pop(ws_id, None)
+@app.api_route("/{path:path}", methods=["GET", "POST", "OPTIONS"])
+async def http_entry(path: str, request: Request):
+    metrics["http_requests"] += 1
+    host = request.headers.get("host")
+    origin = request.headers.get("origin")
+    did = device_from_host(host)
 
-                        # ===============================
-                        # WS CLOSE
-                        # ===============================
-                        elif mtype == "ws_close":
-                            ws_id = payload.get("ws_id")
-                            ws = ws_map.pop(ws_id, None)
-                            if ws:
-                                try:
-                                    await ws.close()
-                                except Exception:
-                                    pass
+    if request.method == "POST":
+        ohost = origin_host(origin)
+        if ohost and host and ohost != host.split(":")[0]:
+            return Response(status_code=303, headers={"Location": "/"})
 
-        except Exception as e:
-            set_status("disconnected", {"error": str(e)})
-            log(f"Relay error: {e}")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)
+    if not did or did not in DEVICES:
+        return Response("Unknown device", status_code=404)
 
+    if not device_ws.get(did):
+        ok = await await_device(did, DEVICE_AWAIT_S)
+        if ok:
+            metrics["await_device_success"] += 1
+        else:
+            metrics["await_device_timeout"] += 1
+            return Response("Device not connected", status_code=503)
+
+    body = await request.body()
+    req_id = str(uuid.uuid4())
+
+    fut = asyncio.get_running_loop().create_future()
+    pending_http[req_id] = fut
+    request_owner[req_id] = did
+
+    headers = {
+        k: v for k, v in request.headers.items()
+        if k.lower() not in (
+            "host", "origin", "referer",
+            "content-length", "connection", "accept-encoding",
+            "x-forwarded-host", "x-forwarded-proto", "x-forwarded-for",
+        )
+    }
+
+    payload = {
+        "request_id": req_id,
+        "method": request.method,
+        "path": "/" + path,
+        "headers": headers,
+        "body_b64": b64e(body),
+    }
+
+    msg = json.dumps({
+        "type": "http_req",
+        "payload": payload,
+        "sig": sign(DEVICES[did], payload),
+    })
+
+    ok = await device_send(did, msg)
+    if not ok:
+        metrics["ws_send_blocked"] += 1
+        pending_http.pop(req_id, None)
+        request_owner.pop(req_id, None)
+        return Response("Device send queue full", status_code=503)
+
+    try:
+        resp = await asyncio.wait_for(fut, timeout=HTTP_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        metrics["http_timeouts"] += 1
+        pending_http.pop(req_id, None)
+        request_owner.pop(req_id, None)
+        return Response("Upstream timeout", status_code=504)
+    except Exception:
+        metrics["http_upstream_errors"] += 1
+        pending_http.pop(req_id, None)
+        request_owner.pop(req_id, None)
+        return Response("Upstream error", status_code=502)
+
+    return Response(
+        content=b64d(resp.get("body_b64", "")),
+        status_code=int(resp.get("status", 502)),
+        headers={
+            k: v for k, v in (resp.get("headers") or {}).items()
+            if k.lower() not in ("content-length", "transfer-encoding", "connection")
+        },
+    )
+
+@app.websocket("/api/websocket")
+async def ws_entry(browser_ws: WebSocket):
+    await browser_ws.accept()
+    metrics["ws_open"] += 1
+
+    did = device_from_host(browser_ws.headers.get("host"))
+    if not did or did not in DEVICES:
+        await browser_ws.close(code=1008)
+        return
+
+    if not device_ws.get(did):
+        ok = await await_device(did, DEVICE_AWAIT_S)
+        if not ok:
+            await browser_ws.close(code=1013)
+            return
+
+    ws_id = str(uuid.uuid4())
+    pending_ws[ws_id] = browser_ws
+
+    payload_open = {"ws_id": ws_id}
+    msg_open = json.dumps({
+        "type": "ws_open",
+        "payload": payload_open,
+        "sig": sign(DEVICES[did], payload_open),
+    })
+
+    ok = await device_send(did, msg_open)
+    if not ok:
+        metrics["ws_send_blocked"] += 1
+        pending_ws.pop(ws_id, None)
+        await browser_ws.close(code=1013)
+        return
+
+    try:
+        while True:
+            msg = await browser_ws.receive_text()
+            metrics["ws_send"] += 1
+
+            payload_send = {"ws_id": ws_id, "data": msg}
+            out = json.dumps({
+                "type": "ws_send",
+                "payload": payload_send,
+                "sig": sign(DEVICES[did], payload_send),
+            })
+
+            ok = await device_send(did, out)
+            if not ok:
+                metrics["ws_send_blocked"] += 1
+                await browser_ws.close(code=1013)
+                break
+
+    except WebSocketDisconnect:
+        pass
+    finally:
+        pending_ws.pop(ws_id, None)
+        payload_close = {"ws_id": ws_id}
+        msg_close = json.dumps({
+            "type": "ws_close",
+            "payload": payload_close,
+            "sig": sign(DEVICES[did], payload_close),
+        })
+        try:
+            await device_send(did, msg_close)
+        except Exception:
+            pass
+
+# ================= START ==================
 if __name__ == "__main__":
-    asyncio.run(main())
+    log("[BOOT] relay starting")
+    log(f"[INFO] devices: {list(DEVICES.keys())}")
+
+    threading.Thread(target=start_tunnel_thread, daemon=True).start()
+
+    uvicorn.run(app, host=USER_HOST, port=USER_PORT, log_level="warning")
