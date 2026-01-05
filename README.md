@@ -1,128 +1,112 @@
-# Remote Relay Client
+# HA Remote Relay Client (Add-on)
 
-Outbound-only secure relay client for Home Assistant API and WebSocket access.
+This Home Assistant add-on enables secure outbound connectivity to a remote relay service, allowing access to a Home Assistant instance without exposing inbound ports or modifying firewall or router configuration.
 
-This add-on enables secure remote access to Home Assistant without exposing inbound ports or requiring VPNs. It follows a **cloud-assisted, outbound-tunnel architecture**, conceptually similar to Home Assistant Cloud (Nabu Casa), while remaining independent and self-contained.
+The add-on is designed for users who require remote access in restricted or CGNAT environments, or who prefer an outbound-only security model.
 
-The solution is designed for **production use**, **multi-device deployments**, and **future SaaS operation**.
+This project is currently in a public pilot phase.
 
 ---
 
 ## Overview
 
-Remote Relay Client runs inside Home Assistant as an add-on and establishes an outbound, authenticated tunnel to a managed relay service. All user interactions continue to use standard Home Assistant authentication and authorization mechanisms.
+The add-on establishes a persistent outbound connection from Home Assistant to a relay service.  
+All incoming requests are routed back through this connection.
 
-At no point does this add-on expose Home Assistant directly to the public internet.
-
----
-
-## Authentication Model
-
-### Home Assistant Authentication
-
-The add-on provides a configuration UI and uses Home Assistant authentication (Auth API).
-
-* User authentication is fully handled by Home Assistant
-* No Home Assistant credentials are accessed, stored, or transmitted by the add-on
-* Authorization and permissions remain enforced by Home Assistant
-
-### Device Authentication
-
-Each Home Assistant instance authenticates to the relay service using a unique device identifier and a per-device secret.
-
-All communication between the add-on and the relay service is cryptographically authenticated.
+Key characteristics:
+- Outbound-only connection (no inbound ports)
+- No port forwarding required
+- Works behind NAT, CGNAT, and firewalls
+- Device-based authentication
+- Designed for multi-instance environments
 
 ---
 
-## Security Design (High-Level)
+## Requirements
 
-This solution follows a **least-privilege, defense-in-depth** approach:
+Before installing the add-on, you must register your Home Assistant instance with the relay service.
 
-* Outbound-only connections from Home Assistant
-* No inbound network exposure
-* No privileged container access
-* No host filesystem access
-* No direct access to Docker, devices, or system services
+1. Create an account at:
 
-Internal implementation details of the relay service are intentionally abstracted and may evolve over time.
+   https://portal.myhalink.com
 
----
+2. Register a new device in the portal.
 
-## Home Assistant Add-on Characteristics
+During registration you will receive:
+- `relay_url`
+- `device_id`
+- `secret`
 
-* Uses Home Assistant Core API
-* Uses Home Assistant Auth API for UI access
-* Does not require host networking
-* Does not expose any ports
-
-Security Rating: **6 / 8** (appropriate for a remote access component)
+These values are required for add-on configuration.
 
 ---
 
 ## Installation
 
-### Pilot / GitHub Installation
-
-This add-on is currently distributed as a **pilot project** via a public GitHub repository and is **not yet available in the official Home Assistant Add-on Store**.
-
-To install:
-
 1. Open Home Assistant and navigate to:
 
-   * **Settings → Add-ons → Add-on Store → Repositories**
+   **Settings → Add-ons → Add-on Store → Repositories**
 
 2. Add the following repository URL:
-
-```
-https://github.com/jurisaro/ha-remote-addon.git
-```
+   
+   https://github.com/jurisaro/ha-remote-addon.git
 
 3. After adding the repository, locate **Remote Relay Client** in the Add-on Store and install it.
-
-4. Configure the add-on using the Home Assistant UI:
-
-   * `relay_url` – URL of the relay service
-   * `device_id` – Unique identifier for this Home Assistant instance
-   * `secret` – Per-device shared secret
-
-5. Start the add-on.
-
-Once started, the add-on will establish an outbound connection to the relay service.
-
-No inbound ports, firewall rules, or router configuration changes are required.
 
 ---
 
 ## Configuration
 
-The add-on is configured exclusively through the Home Assistant UI.
+Configure the add-on using the Home Assistant UI.
 
-Required options:
+Required fields:
 
-* `relay_url` – URL of the relay service
-* `device_id` – Unique identifier for this Home Assistant instance
-* `secret` – Per-device shared secret
+- `relay_url`  
+The relay service endpoint provided by the portal.
 
----
+- `device_id`  
+Unique identifier for this Home Assistant instance.
 
-## Intended Use
+- `secret`  
+Per-device shared secret used for authentication.
 
-Remote Relay Client is intended to be used as:
-
-* A managed remote access service
-* A private or enterprise deployment
-* A foundation for a SaaS offering
-
-The add-on is designed to integrate cleanly into Home Assistant environments without altering existing security assumptions.
+Do not reuse secrets between devices.
 
 ---
 
-## Notes on Trust
+## Usage
 
-As with any remote access solution, users should only connect to relay services they trust. The add-on itself does not weaken Home Assistant’s internal security model and relies on Home Assistant’s native authentication and authorization layers.
+1. Start the add-on.
+2. The add-on will establish an outbound connection to the relay service.
+3. Once connected, the device becomes reachable via its assigned relay endpoint.
+
+No inbound ports, firewall rules, or router configuration changes are required.
 
 ---
 
-## License & Support
+## Security Model (High-Level)
 
-License and support terms depend on the distribution model of the service.
+- Devices are allowlisted server-side.
+- Authentication is device-specific.
+- All connections are initiated from the Home Assistant instance.
+- Long-lived or high-risk endpoints are restricted by design.
+
+Implementation details are intentionally not exposed.
+
+---
+
+## Status
+
+This add-on is part of a public pilot project.  
+Functionality, APIs, and service availability may change.
+
+Feedback from early users is welcome.
+
+---
+
+## Support
+
+For portal access, device registration, and service-related questions:
+
+https://portal.myhalink.com
+
