@@ -28,7 +28,7 @@ Before installing the add-on, you must register your Home Assistant instance wit
 
 1. Create an account at:
 
-   https://portal.myhalink.com
+   https://panel.myhalink.com
 
 2. Register a new device in the portal.
 
@@ -108,5 +108,5 @@ Feedback from early users is welcome.
 
 For portal access, device registration, and service-related questions:
 
-https://portal.myhalink.com
+https://panel.myhalink.com
 
